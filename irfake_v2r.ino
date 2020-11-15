@@ -6,20 +6,35 @@
  *    IRsendDemo on https://github.com/z3t0/Arduino-IRremote
  *    https://gist.github.com/sukedai/1759605
  *  Version 1.0 by pado3 2020/09/18
+ *  Version 2.0 by pado3 2020/11/15 change INT timing fm CHANGE to FALLING
+ *  Version 2.1 by pado3 2020/11/16 add powerdown mode
  */
 
 #include <stdio.h>
-#include <IRremote.h>
-#define maxLen 500 // 信号の最大長, Vieraは基本的に100
-#define IR_VCC 10  // IRICのVCC
-#define IR_GND 9   // IRICのGND
-// IR_RECEIVE_PIN = 2 // attachInterrupt(0, ...)を使う
-// IR_SEND_PIN 3      // どこで定義されているか不明だがIRremote制限
+#include <IRremote.h>   // 送信のみで使用
+#include <avr/sleep.h>  // v2.1でパワーダウン対応
+#define maxLen 200      // 信号の最大長, Vieraは50なので長ければ捨てる
+#define IR_VCC 10       // IR受信モジュールのVCC 47Ω 10uFのLPFを通す
+#define IR_GND 9        // IR受信モジュールのGND
+// IR_RECEIVE_PIN 2     // attachInterrupt(0, ...)を使うのでD2使用
+// IR_SEND_PIN 3        // どこで定義されているか不明だがIRremote制約
+//                         D3から47Ωを通して赤外線LEDを光らせる
 // 次の2つはISR割り込みルーチンで変化するためレジスタでなくRAMからロード
 volatile unsigned int irBuffer[maxLen]; // IRを受信した時間
 volatile unsigned int x = 0; // 信号の長さ Pointer thru irBuffer
 int splash = 0;
+unsigned int prevx = 0; // 前回ループ時のx値、これが増えていなければゴミ
+unsigned long last_ms;  // 最後に割込があった時点のmillis() 
 IRsend irsend;
+
+// 関数の型定義
+void setup(void);
+void loop(void);
+unsigned long v2r(unsigned long);
+unsigned long recvViera();
+unsigned long Str2Hex(const char*);
+void powerdown(void);
+void rxIR_Interrupt_Handler(void);
 
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
@@ -34,7 +49,8 @@ void setup() {
   Serial.println(F("START " __FILE__ " from " __DATE__));
   // Receiver setup
   Serial.println(F("Please send me Panasonic remocon with PIN2"));
-  attachInterrupt(0, rxIR_Interrupt_Handler, CHANGE);
+  //  attachInterrupt(0, rxIR_Interrupt_Handler, CHANGE); // v2.0:BOTH=>FALL for stability
+  attachInterrupt(0, rxIR_Interrupt_Handler, FALLING);
   // Transmitter setup
   Serial.print(F("Ready to send IR signals at pin "));
   Serial.println(IR_SEND_PIN);
@@ -64,9 +80,15 @@ void loop() {
     } else {
       Serial.print(F("Send data: PASS"));
     }
-    // 消すまでの待ち時間はrecvViera側で設定した
     digitalWrite(LED_BUILTIN, LOW);
+    last_ms = millis();
     Serial.println(F(", wait next"));
+  }
+  if (10000 < (millis() - last_ms)) { // 10秒以上データが来なかったらパワーダウン
+    Serial.println(F("Zzz.."));
+    delay(10);
+    powerdown();
+    Serial.println(F("wake up!"));
   }
 }
 
@@ -274,59 +296,74 @@ unsigned long v2r(unsigned long viera) {
 }
 
 unsigned long recvViera() {
-  String recvs; // ゴミが紛れ込むことがあるので、まずStringで受けて、
-  unsigned long recvL;  // データを確認したら数値に変換して返す
-  int i;  // ありきたりなループカウンタ
-  if (maxLen < x) { // 派手なノイズが入ったとき
-    Serial.print(F("TOO NOISY! count:"));
-    Serial.println(x);
-    x = 0;
-    recvL = 0;
-  }
-  if (100 <= x ) { // for Panasonic Viera
-    int cnt = 0;    // digit
-    int hexval = 0; // sum of 8digits C_0 C_1 ... C_7
-    // int slen = (x - 3)/2; // length of signal [bit]
-    recvs = "";      // 受信データ文字列, String
-    recvL = 0;       // 受信データ数値, unsigned long
-    detachInterrupt(0); // いったん割り込みを止める
-    // 絶対時間を相対時間すなわちパルス長に変換
-    for (int i = 1; i < x; i++) {
-      irBuffer[i-1] = irBuffer[i] - irBuffer[i-1];
-    }
-    // hex array. 8T 4T { } T
-    for (i = 2; i < 99; i++) {  // Panasonic Viera 48bit
-      if (i%2 == 1){
-        if (irBuffer[i]> 900){ // T=450usならおよそ2Tが閾値
-          hexval += 1 << cnt;
-        }
-        cnt++;
-        if (cnt == 8) { // 8bitまとまったらHEX文字列を得る
-          if(hexval < 16) { // padding
-            recvs += "0";
-          }
-          recvs += String(hexval, HEX);
-          cnt = 0;
-          hexval = 0;
-        }
+  String recvs = "";        // ゴミが紛れ込むことがあるので、まずStringで受けて、
+  unsigned long recvL = 0;  // データを確認したら数値に変換して返す
+  unsigned int llen;        // リーダ部の長さ
+  int i, cnt, hexval;       // ループカウンタ, デコードカウンタ, hex値の元
+  delay(130); // バッファに家電協の最大信号長130msは溜めてから処理
+  if (0 < x) {  // データがあれば、先頭がリーダ部か確認する
+    llen = irBuffer[1] - irBuffer[0];
+    // 家電協の最小リーダ長4200usを下回っているときはゴミ。このあたりは使うリモコンの規格次第
+    // cf. http://elm-chan.org/docs/ir_format.html
+    if (llen < 4000) {
+      Serial.println(F("1st data is too short, clear buffer"));
+      x = 0;
+    } else {
+      /* DEBUG
+      Serial.print(F("leader length: "));
+      Serial.print(llen);
+      Serial.println(F("us"));
+      */
+      if (x == prevx) { // 前のループからデータが増えていなければ、ゴミとみなして消す。これ有効
+        Serial.println(F("buffer is not incremented, clear buffer"));
+        x = 0;
+      } else {
+        prevx = x;
       }
     }
-    if (!recvs.startsWith("022080")) { // ヘッダが0x022080ならほぼ正しいデータ
+  }
+  if (50 <= x ) { // 50以上バッファに溜まればデコードする(Vieraの有効信号はL+dat48+Tで50)
+    Serial.print(F("count: "));
+    Serial.print(x);
+    Serial.print(F(", "));
+    // detachInterrupt(0); // いったん割り込みを止める // v2.0でごみ処理できたので止めない
+    // 絶対時間を相対時間すなわちパルス長に変換
+    // for (int i = 1; i < x; i++) {  // 以前は全データをデコードしていた
+    for (i = 1; i <= 50; i++) { // Vieraなら50組だけ読めばいい。後ろにゴミがついても無視
+      irBuffer[i-1] = irBuffer[i] - irBuffer[i-1];
+    }
+    // ここからLSBファーストのbit-byte変換。念のためのパラメータ初期化
+    cnt = 0;    // digit
+    hexval = 0; // sum of 8digits C0 C1 ... C7 (LSB first)
+    for (i = 1; i <= 48; i++) { // Panasonic Viera 48bit
+      if (1200 < irBuffer[i]){  // 2Tと4Tの閾値、2T:max1000us 4T:min1400us
+        hexval += 1 << cnt;
+      }
+      cnt++;
+      if (cnt == 8) { // 8bitまとまったらHEXの文字列に変換する
+        if(hexval < 16) { // padding
+          recvs += "0";
+        }
+        recvs += String(hexval, HEX);
+        cnt = 0;
+        hexval = 0;
+      }
+    }
+    if (!recvs.startsWith("022080")) { // Vieraはヘッダが0x022080でなければおかしい
       Serial.print(recvs);
-      Serial.println(F(" received but maybe noise (or DIGA), return NULL"));
+      Serial.println(F(" is not Viera data, return NULL"));
       recvs = "";
       recvL = 0;
     } else {
-      // Vieraのヘッダと思しき 0x022080 を切り詰める
+      // Vieraのヘッダ 0x022080 を切り詰める
       recvs = recvs.substring(6);
       // 数値のHEXに変換
       recvL = Str2Hex(recvs.c_str());
     }
-    // Serial.println();
-    x = 0;  // 割り込み再開前に初期化する
-    attachInterrupt(0, rxIR_Interrupt_Handler, CHANGE);
+    delay(200); // リピート対策、これがないとsendでコケる
+    x = 0;  // デコード完了したところで初期化
+    // attachInterrupt(0, rxIR_Interrupt_Handler, FALLING); // 割込は止めない
   }
-  delay(300); // 待ちを入れないとノイズを拾いやすい。このぐらいが適当そう
   return recvL;
 }
 
@@ -335,7 +372,19 @@ unsigned long Str2Hex(const char* str)
      return strtol(str, 0, 16); // strtoulだと最上位ビットが反転してしまった
 }
 
-void rxIR_Interrupt_Handler() { // 割り込みは常にCHANGEで呼ぶ
+void powerdown(void) {
+  // IR受信modの消費電流はtyp.300uA max.600uA
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+  // ADC停止、使うときは0x80（たぶんpinModeで設定）だが、このスケッチでは使わない
+  ADCSRA = 0x00; 
+  // 低電圧検出器(BOD:brown-out detector)停止
+  // MCUCRのBODSとBODSEに1をセットし、4クロック内にBODSを1, BODSSEを0に設定
+  MCUCR |= (1 << BODSE) | (1 << BODS);
+  MCUCR = (MCUCR & ~(1 << BODSE)) | (1 << BODS);
+  sleep_mode(); // sleep_(enable + cpu + disable), 割り込みで戻るときに使いやすい
+}
+
+void rxIR_Interrupt_Handler() { // 割り込みはFALLINGに変えた2020/11/15
   if (x > maxLen) return; //ignore if irBuffer is already full
   irBuffer[x++] = micros(); //just continually record the time-stamp of signal transitions
 }
