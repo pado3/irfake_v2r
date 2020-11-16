@@ -305,7 +305,7 @@ unsigned long recvViera() {
     llen = irBuffer[1] - irBuffer[0];
     // 家電協の最小リーダ長4200usを下回っているときはゴミ。このあたりは使うリモコンの規格次第
     // cf. http://elm-chan.org/docs/ir_format.html
-    if (llen < 4000) {
+    if (llen < 4000) {  // 割込自体とパワーダウン復帰時のBOD禁止影響60usをざっくり見込む
       Serial.println(F("1st data is too short, clear buffer"));
       x = 0;
     } else {
@@ -378,7 +378,7 @@ void powerdown(void) {
   // ADC停止、使うときは0x80（たぶんpinModeで設定）だが、このスケッチでは使わない
   ADCSRA = 0x00; 
   // 低電圧検出器(BOD:brown-out detector)停止
-  // MCUCRのBODSとBODSEに1をセットし、4クロック内にBODSを1, BODSSEを0に設定
+  // MCUCRのBODSとBODSEに1をセットし、4クロック内にBODSを1, BODSEを0に設定
   MCUCR |= (1 << BODSE) | (1 << BODS);
   MCUCR = (MCUCR & ~(1 << BODSE)) | (1 << BODS);
   sleep_mode(); // sleep_(enable + cpu + disable), 割り込みで戻るときに使いやすい
